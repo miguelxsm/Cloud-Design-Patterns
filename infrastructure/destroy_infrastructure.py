@@ -67,3 +67,4 @@ def destroy_all():
 
 if __name__ == "__main__":
     destroy_all()
+    print("Successfylly deleted")
