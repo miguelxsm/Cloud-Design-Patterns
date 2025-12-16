@@ -64,3 +64,6 @@ def destroy_all():
 
     _delete_sg_with_retry(sg_main_id)
 
+
+if __name__ == "__main__":
+    destroy_all()
