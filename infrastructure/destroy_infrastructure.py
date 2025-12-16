@@ -46,10 +46,20 @@ def _delete_sg_with_retry(sg_id: str, retries: int = 5) -> None:
                 return
             raise
 
+def _terminate_instances_and_wait(ids: list[str]) -> None:
+    if not ids:
+        return
+    ec2.terminate_instances(InstanceIds=ids)
+    print(f"Terminating instances: {ids}...")
+    waiter = ec2.get_waiter("instance_terminated")
+    waiter.wait(InstanceIds=ids)
+    print(f"Instances terminated: {ids}")
+
 def destroy_all():
     sg_main_id   = _get_sg_id_by_name(SG_MAIN_NAME)
 
     instance_ids = _list_instance_ids_for_sgs(sg_main_id)
+
     _terminate_instances_and_wait(instance_ids)
 
     _delete_sg_with_retry(sg_main_id)
