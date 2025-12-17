@@ -3,20 +3,49 @@ import time
 import json
 import requests
 import pathlib
+import argparse
 from infrastructure.create_security_group import create_security_group
 from infrastructure.destroy_infrastructure import destroy_all
-from infrastructure.constants import SG_MAIN_NAME, build_main_permissions, SG_PROXY_NAME, IP_PERMISSIONS_PROXY
+from infrastructure.constants import SG_MAIN_NAME, build_main_permissions, SG_PROXY_NAME, IP_PERMISSIONS_PROXY, _REPO_ROOT
 from tools.instance_discovery import get_vpc_id_from_instances
 from infrastructure.create_instances import create_main_instances, create_proxy_instance
 from tools.utils import save_instance_ips
 if __name__ == "__main__":
 
-    try:
-        print("--- CREATING SECURITY GROUP ---")
-        vpc_id = get_vpc_id_from_instances()
+    create_sg = False
+    create_instances = False
+    create_proxy = False
+    destroy = False
 
-        print("VPC ID: ", vpc_id)
+    parser = argparse.ArgumentParser(description="Final Assignment Cloud Computing")
 
+    parser.add_argument("--sg", action="store_true", help="Create security groups")
+    parser.add_argument("--instances", action="store_true", help="Create main instances")
+    parser.add_argument("--proxy", action="store_true", help="Create proxy instance")
+    parser.add_argument("--destroy", action="store_true", help="Destroy Infrastructure")
+
+
+    args = parser.parse_args()
+
+    if args.destroy:
+        destroy_all()
+        print("Successfully erased")
+        exit(0)
+
+    if not (args.sg or args.instances or args.proxy):
+        create_sg = True
+        create_instances = True
+        create_proxy = True
+    else:
+        create_sg = args.sg
+        create_instances = args.instances
+        create_proxy = args.proxy
+
+    vpc_id = get_vpc_id_from_instances()
+
+    print("VPC ID: ", vpc_id)
+    if create_sg:
+        print("--- CREATING SECURITY GROUP FOR PROXY ---")
         sg_proxy = create_security_group(
             SECURITY_GROUP_NAME=SG_PROXY_NAME,
             PERMISSIONS=IP_PERMISSIONS_PROXY,
@@ -24,27 +53,35 @@ if __name__ == "__main__":
             VPC_ID=vpc_id
         )
         
-        proxy_instance = create_proxy_instance(SG_PROXY_NAME)
-
-        path = save_instance_ips({"proxy" : proxy_instance})
-
-        print("Proxy Info saved in ", path)
-        
         sg_main = create_security_group(
             SECURITY_GROUP_NAME=SG_MAIN_NAME,
             PERMISSIONS=build_main_permissions(sg_proxy),
             DESCRIPTION="Main security group",
             VPC_ID=vpc_id
             )
-        
+    if create_main_instances:
         instances = create_main_instances(SG_MAIN_NAME)
-
+        
         save_instance_ips(instances)
 
-        while True:
-            ...
+    ips = [instances[key]["private_ip"] for key in instances.keys()]
+
+    # [manager_ip, worker1_ip, worker2_ip]
+    print("private ips", ips)
 
 
-    except KeyboardInterrupt:
-        print("CTRL + C Finishing Program...")
-        destroy_all()
+    if create_proxy_instance:
+        # path = os.path.join(_REPO_ROOT, "deployment", "ips_info.json")
+        # with open(path, "r", encoding="utf-8") as f:
+        #     data = json.load(f)
+        # data.
+        proxy_instance = create_proxy_instance(SG_PROXY_NAME, ips)
+        
+        path = save_instance_ips({"proxy" : proxy_instance})
+        print("Proxy Info saved in ", path)
+
+
+    while True:
+        ...
+
+
