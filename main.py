@@ -59,29 +59,22 @@ if __name__ == "__main__":
             DESCRIPTION="Main security group",
             VPC_ID=vpc_id
             )
-    if create_main_instances:
+    if create_instances:
         instances = create_main_instances(SG_MAIN_NAME)
         
         save_instance_ips(instances)
 
-    ips = [instances[key]["private_ip"] for key in instances.keys()]
 
-    # [manager_ip, worker1_ip, worker2_ip]
-    print("private ips", ips)
-
-
-    if create_proxy_instance:
-        # path = os.path.join(_REPO_ROOT, "deployment", "ips_info.json")
-        # with open(path, "r", encoding="utf-8") as f:
-        #     data = json.load(f)
-        # data.
+    if create_proxy:
+        path = os.path.join(_REPO_ROOT, "deployment", "ips_info.json")
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        ips = [data[key]["private_ip"] for key in data.keys()]
+        print("private ips", ips)
         proxy_instance = create_proxy_instance(SG_PROXY_NAME, ips)
         
         path = save_instance_ips({"proxy" : proxy_instance})
         print("Proxy Info saved in ", path)
 
-
-    while True:
-        ...
 
 
