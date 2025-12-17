@@ -6,35 +6,38 @@ from tools.utils import get_code
 ec2 = boto3.resource("ec2", region_name=REGION)
 
 
-def create_instance(instance_type, sg_id, role_tag, user_data):
+def create_instance(instance_type, sg_id, role_tag, user_data=None):
     """
     Creates an EC2 instance with:
     - Type instance_type
     - Security Group sg_id
-    - Startup script user_data (may be empty for now)
+    - Optional startup script user_data
     """
-    instances = ec2.create_instances(
-        ImageId="ami-0ecb62995f68bb549",  # Ubuntu
-        InstanceType=instance_type,
-        MinCount=1,
-        MaxCount=1,
-        SecurityGroupIds=[sg_id],
-        UserData=user_data,
-        TagSpecifications=[
+    params = {
+        "ImageId": "ami-0ecb62995f68bb549",  # Ubuntu
+        "InstanceType": instance_type,
+        "MinCount": 1,
+        "MaxCount": 1,
+        "SecurityGroupIds": [sg_id],
+        "TagSpecifications": [
             {
                 "ResourceType": "instance",
                 "Tags": [{"Key": "Role", "Value": role_tag}]
             }
         ],
-        KeyName=KEY_PAIR_NAME
-    )
+        "KeyName": KEY_PAIR_NAME
+    }
+
+    if user_data is not None:
+        params["UserData"] = user_data
+
+    instances = ec2.create_instances(**params)
 
     instance = instances[0]
     instance.wait_until_running()
     instance.reload()
     if not instance.public_ip_address:
         raise RuntimeError(f"Instance {instance.id} did not obtain a public IP. Check subnet settings.")
-    
     
     return {
         "id": instance.id,
@@ -70,3 +73,12 @@ def create_main_instances(sg_name: str):
     
     
     return {"manager": manager, "workers": workers}
+
+def create_proxy_instance(sg_proxy_name: str):
+    instance = create_instance(
+        instance_type="t2.micro",
+        sg_id = sg_proxy_name,
+        role_tag="proxy",
+    )
+
+    return instance
