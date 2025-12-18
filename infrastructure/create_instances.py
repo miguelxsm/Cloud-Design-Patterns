@@ -2,7 +2,7 @@ import os
 import boto3
 from infrastructure.constants import REGION, KEY_PAIR_NAME, SQL_USER, SQL_PASSWORD
 from tools.utils import get_code
-from deployment.setup_instances import build_proxysql_user_data, build_manager_and_workers
+from deployment.setup_instances import build_proxysql_user_data, build_manager_user_data, build_workers_user_data
 
 
 ec2 = boto3.resource("ec2", region_name=REGION)
@@ -41,9 +41,10 @@ def create_instance(instance_type, sg_id, role_tag, user_data):
 
 def create_main_instances(sg_name: str):
 
-    code = build_manager_and_workers(
+    code_manager = build_manager_user_data(
         mysql_user=SQL_USER,
         mysql_pass=SQL_PASSWORD,
+        server_id=1
     )
 
     print("Creating 3 t2.micro instances...")
@@ -51,23 +52,36 @@ def create_main_instances(sg_name: str):
     manager = create_instance(
                 instance_type="t2.micro",
                 sg_id=sg_name,
-                user_data=code,
+                user_data=code_manager,
                 role_tag="manager"
     )
-
     print("Instance manager successfully created", manager)
 
+    code_worker1 = build_workers_user_data(
+        mysql_user=SQL_USER,
+        mysql_pass=SQL_PASSWORD,
+        manager_ip=manager["private_ip"],
+        server_id=2
+    )
     worker1 = create_instance(
                     instance_type="t2.micro",
                     sg_id=sg_name,
                     role_tag="worker1",
-                    user_data=code
+                    user_data=code_worker1
                 )
+
+    code_worker2 = build_workers_user_data(
+            mysql_user=SQL_USER,
+            mysql_pass=SQL_PASSWORD,
+            manager_ip=manager["private_ip"],
+            server_id=3
+        )
+
     worker2 =  create_instance(
                     instance_type="t2.micro",
                     sg_id=sg_name,
                     role_tag="worker2",
-                    user_data=code
+                    user_data=code_worker2
                 )
     
     print("Instances of workers successfully created", worker1, worker2)

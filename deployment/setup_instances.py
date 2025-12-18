@@ -1,25 +1,63 @@
-def build_manager_and_workers(mysql_user="proxyuser", mysql_pass="proxypass") -> str:
-  return f"""#!/bin/bash
+def _ensure_mysqld_option_block(option_lines: str) -> str:
+    """
+    Helper: returns a bash snippet that ensures each line in option_lines exists
+    under [mysqld] in /etc/mysql/mysql.conf.d/mysqld.cnf (Ubuntu mysql-server).
+    """
+    # We keep it simple: if a key exists, replace; else append under [mysqld].
+    # option_lines must be "key = value" lines (one per line).
+    lines = [ln.strip() for ln in option_lines.strip().splitlines() if ln.strip()]
+    bash = []
+    bash.append('CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"')
+    bash.append('if [ -f "$CNF" ]; then')
+    for ln in lines:
+        key = ln.split("=", 1)[0].strip()
+        # Replace if present, else add under [mysqld]
+        bash.append(f'  if grep -qE "^{key}\\s*=" "$CNF"; then')
+        bash.append(f'    sed -i "s|^{key}\\s*=.*|{ln}|" "$CNF"')
+        bash.append("  else")
+        bash.append(f'    sed -i "/^\\[mysqld\\]/a {ln}" "$CNF"')
+        bash.append("  fi")
+    bash.append("fi")
+    return "\n".join(bash)
+
+
+def build_manager_user_data(
+    mysql_user: str,
+    mysql_pass: str,
+    server_id: int = 1,
+    repl_user: str = "repl",
+    repl_pass: str = "replpass",
+) -> str:
+    mysqld_opts = f"""
+bind-address = 0.0.0.0
+server-id = {server_id}
+log_bin = /var/log/mysql/mysql-bin.log
+binlog_do_db = sakila
+gtid_mode = ON
+enforce_gtid_consistency = ON
+log_replica_updates = ON
+"""
+    ensure_opts = _ensure_mysqld_option_block(mysqld_opts)
+
+    return f"""#!/bin/bash
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -y
 apt-get install -y mysql-server wget unzip
 
-# Permitir conexiones remotas (ProxySQL está en otra instancia)
-# Ubuntu suele usar /etc/mysql/mysql.conf.d/mysqld.cnf
-if [ -f /etc/mysql/mysql.conf.d/mysqld.cnf ]; then
-  # Si existe bind-address, lo sustituye; si no, lo añade bajo [mysqld]
-  if grep -q '^bind-address' /etc/mysql/mysql.conf.d/mysqld.cnf; then
-    sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mysql.conf.d/mysqld.cnf
-  else
-    sed -i '/^\[mysqld\]/a bind-address = 0.0.0.0' /etc/mysql/mysql.conf.d/mysqld.cnf
-  fi
-fi
+{ensure_opts}
 
 systemctl enable mysql
 systemctl restart mysql
 
+# Esperar a MySQL
+for i in $(seq 1 30); do
+  mysqladmin ping --silent && break
+  sleep 1
+done
+
+# Importar Sakila SOLO en el manager (source)
 cd /tmp
 wget -O sakila-db.zip https://downloads.mysql.com/docs/sakila-db.zip
 unzip -o sakila-db.zip
@@ -29,13 +67,109 @@ if ! mysql -e "USE sakila;" 2>/dev/null; then
   mysql < /tmp/sakila-db/sakila-data.sql
 fi
 
+# Usuario app (para ProxySQL/cliente)
 MYSQL_USER="{mysql_user}"
 MYSQL_PASS="{mysql_pass}"
 
 mysql -e "CREATE USER IF NOT EXISTS '${{MYSQL_USER}}'@'%' IDENTIFIED WITH mysql_native_password BY '${{MYSQL_PASS}}';"
-mysql -e "GRANT ALL PRIVILEGES ON sakila.* TO '${{MYSQL_USER}}'@'%' ;"
+mysql -e "GRANT ALL PRIVILEGES ON sakila.* TO '${{MYSQL_USER}}'@'%';"
 mysql -e "FLUSH PRIVILEGES;"
+
+# Usuario replicación (workers -> manager)
+REPL_USER="{repl_user}"
+REPL_PASS="{repl_pass}"
+
+mysql -e "CREATE USER IF NOT EXISTS '${{REPL_USER}}'@'%' IDENTIFIED WITH mysql_native_password BY '${{REPL_PASS}}';"
+mysql -e "GRANT REPLICATION SLAVE ON *.* TO '${{REPL_USER}}'@'%';"
+mysql -e "FLUSH PRIVILEGES;"
+
+# Diagnóstico básico
+mysql -e "SHOW VARIABLES LIKE 'gtid_mode';"
+mysql -e "SHOW VARIABLES LIKE 'log_bin';"
+mysql -e "SHOW MASTER STATUS\\G" || true
 """
+
+
+def build_workers_user_data(
+    mysql_user: str,
+    mysql_pass: str,
+    manager_ip: str,
+    server_id: int,
+    repl_user: str = "repl",
+    repl_pass: str = "replpass",
+) -> str:
+    mysqld_opts = f"""
+bind-address = 0.0.0.0
+server-id = {server_id}
+gtid_mode = ON
+enforce_gtid_consistency = ON
+relay_log = /var/log/mysql/mysql-relay-bin.log
+"""
+    ensure_opts = _ensure_mysqld_option_block(mysqld_opts)
+
+    return f"""#!/bin/bash
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y mysql-server
+
+{ensure_opts}
+
+systemctl enable mysql
+systemctl restart mysql
+
+# Esperar a MySQL
+for i in $(seq 1 30); do
+  mysqladmin ping --silent && break
+  sleep 1
+done
+
+# Usuario app (para ProxySQL/cliente)
+MYSQL_USER="{mysql_user}"
+MYSQL_PASS="{mysql_pass}"
+
+mysql -e "CREATE USER IF NOT EXISTS '${{MYSQL_USER}}'@'%' IDENTIFIED WITH mysql_native_password BY '${{MYSQL_PASS}}';"
+mysql -e "GRANT ALL PRIVILEGES ON sakila.* TO '${{MYSQL_USER}}'@'%';"
+mysql -e "FLUSH PRIVILEGES;"
+
+# Configurar replicación con GTID auto-position (worker -> manager)
+REPL_USER="{repl_user}"
+REPL_PASS="{repl_pass}"
+MANAGER_IP="{manager_ip}"
+
+# MySQL 8: START REPLICA / CHANGE REPLICATION SOURCE TO
+
+for i in $(seq 1 60); do
+  nc -z "${{MANAGER_IP}}" 3306 && break
+  sleep 2
+done
+
+for i in $(seq 1 60); do
+  mysql -h "${{MANAGER_IP}}" -u repl -preplpass -e "SELECT 1" && break
+  sleep 2
+done
+
+mysql -e "STOP REPLICA;" || true
+mysql -e "RESET REPLICA ALL;" || true
+
+mysql -e "CHANGE REPLICATION SOURCE TO
+  SOURCE_HOST='${{MANAGER_IP}}',
+  SOURCE_USER='${{REPL_USER}}',
+  SOURCE_PASSWORD='${{REPL_PASS}}',
+  SOURCE_PORT=3306,
+  SOURCE_AUTO_POSITION=1;"
+
+mysql -e "START REPLICA;"
+
+mysql -e "SET GLOBAL read_only = ON;"
+mysql -e "SET GLOBAL super_read_only = ON;"
+
+
+# Diagnóstico
+mysql -e "SHOW REPLICA STATUS\\G" | egrep -i 'Replica_IO_Running|Replica_SQL_Running|Last_.*Error|Source_Host|Retrieved_Gtid_Set|Executed_Gtid_Set' || true
+"""
+
 
 def build_proxysql_user_data(
     manager_ip: str,
