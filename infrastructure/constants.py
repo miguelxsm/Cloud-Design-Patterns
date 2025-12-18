@@ -9,10 +9,10 @@ SG_PROXY_NAME = "SG_PROXY"
 
 MY_IP = requests.get('https://ifconfig.me', timeout=5).text.strip()
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
-_DEFAULT_KEY = _REPO_ROOT / "labsuser.pem"
-PRIVATE_KEY_PATH = os.environ.get("SSH_PRIVATE_KEY", str(_DEFAULT_KEY))
 KEY_PAIR_NAME =  "mainkey"
 
+SQL_USER = "mysqluser"
+SQL_PASSWORD = "mysqlpassword"
 def build_main_permissions(sg_proxy_id: str):
     return [
         {

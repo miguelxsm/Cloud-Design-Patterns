@@ -11,10 +11,6 @@ def get_code(path: str):
     return code
 
 
-import os
-import json
-from typing import Dict, Any, Union, List
-
 def save_instance_ips(topology: Dict[str, Any]) -> str:
     path = os.path.join(_REPO_ROOT, "deployment", "ips_info.json")
     os.makedirs(os.path.dirname(path), exist_ok=True)
