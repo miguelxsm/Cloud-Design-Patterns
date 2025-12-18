@@ -1,7 +1,10 @@
-from infrastructure.constants import _REPO_ROOT
+from infrastructure.constants import _REPO_ROOT, REGION
 import os
 import json
 from typing import Dict, Any
+import boto3
+
+ec2 = boto3.client("ec2", region_name=REGION)
 
 
 def get_code(path: str):
@@ -9,6 +12,14 @@ def get_code(path: str):
     with open(code_path, "r") as f:
         code = f.read()
     return code
+
+def get_vpc_id_from_instances():
+    ec2 = boto3.client("ec2", region_name=REGION)
+    resp = ec2.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
+    if resp["Vpcs"]:
+        vpc_id = resp["Vpcs"][0]["VpcId"]
+        print(f"VPC id found: {vpc_id}")
+        return vpc_id
 
 
 def save_instance_ips(topology: Dict[str, Any]) -> str:
