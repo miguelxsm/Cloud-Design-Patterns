@@ -89,14 +89,15 @@ def create_main_instances(sg_name: str):
     
     return {"manager": manager, "worker1": worker1, "worker2":worker2}
 
-def create_proxy_instance(sg_proxy_name: str, instances: dict):
+def create_proxy_instance(sg_proxy_name: str, instances: dict, strategy: str):
     manager_ip = instances[0]
     workers = instances[1:]
     user_data = build_proxysql_user_data(
         manager_ip=manager_ip,
         worker_ips=workers,
         mysql_user=SQL_USER,
-        mysql_pass=SQL_PASSWORD
+        mysql_pass=SQL_PASSWORD,
+        strategy=strategy
         )
     
     instance = create_instance(

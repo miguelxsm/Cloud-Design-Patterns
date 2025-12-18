@@ -170,14 +170,12 @@ mysql -e "SET GLOBAL super_read_only = ON;"
 mysql -e "SHOW REPLICA STATUS\\G" | egrep -i 'Replica_IO_Running|Replica_SQL_Running|Last_.*Error|Source_Host|Retrieved_Gtid_Set|Executed_Gtid_Set' || true
 """
 
-
-def build_proxysql_user_data(
+def base_code_proxy(
     manager_ip: str,
     worker_ips: list[str],
     mysql_user: str = "proxyuser",
     mysql_pass: str = "proxypass",
 ) -> str:
-    workers_sql_values = ", ".join([f"(20,'{ip}',3306,200)" for ip in worker_ips])
 
     return f"""#!/bin/bash
 set -euxo pipefail
@@ -195,16 +193,13 @@ apt-get install -y proxysql
 
 systemctl enable proxysql
 
-# Forzar frontend MySQL a 3306 en el cnf (SIN regex con paréntesis)
 sed -i 's/interfaces="0.0.0.0:6033"/interfaces="0.0.0.0:3306"/' /etc/proxysql.cnf || true
 sed -i 's/interfaces="0.0.0.0:6033;\\/tmp\\/proxysql.sock"/interfaces="0.0.0.0:3306;\\/tmp\\/proxysql.sock"/' /etc/proxysql.cnf || true
 
-# Arranque limpio: borrar DB interna para que no “recuerde” 6033
 systemctl stop proxysql || true
 rm -f /var/lib/proxysql/proxysql.db || true
 systemctl start proxysql
 
-# Espera a admin port
 for i in $(seq 1 30); do
   nc -z 127.0.0.1 6032 && break
   sleep 1
@@ -216,17 +211,14 @@ if ! nc -z 127.0.0.1 6032; then
   exit 1
 fi
 
-# Backends
 mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
 DELETE FROM mysql_servers;
 INSERT INTO mysql_servers(hostgroup_id,hostname,port,max_connections) VALUES
-(10,'{manager_ip}',3306,200),
-{workers_sql_values};
+(10,'{manager_ip}',3306,200);
 LOAD MYSQL SERVERS TO RUNTIME;
 SAVE MYSQL SERVERS TO DISK;
 "
 
-# Usuario
 mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
 DELETE FROM mysql_users;
 INSERT INTO mysql_users(username,password,default_hostgroup) VALUES
@@ -234,16 +226,48 @@ INSERT INTO mysql_users(username,password,default_hostgroup) VALUES
 LOAD MYSQL USERS TO RUNTIME;
 SAVE MYSQL USERS TO DISK;
 "
-
-# Reglas
-mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
-DELETE FROM mysql_query_rules;
-INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
-(1,1,'^SELECT.*FOR UPDATE',10,1),
-(2,1,'^SELECT',20,1);
-LOAD MYSQL QUERY RULES TO RUNTIME;
-SAVE MYSQL QUERY RULES TO DISK;
-"
-
-ss -lntp | egrep '3306|6032|6033|proxysql' || true
 """
+
+def build_proxysql_user_data(
+    manager_ip: str,
+    worker_ips: list[str],
+    mysql_user: str = "proxyuser",
+    mysql_pass: str = "proxypass",
+    strategy: str = "direct_hit",
+) -> str:
+    workers_sql_values = ", ".join([f"(20,'{ip}',3306,200)" for ip in worker_ips])
+    rules = {
+        # TODO al manager
+        "direct_hit": r"""
+        mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
+        DELETE FROM mysql_query_rules;
+        INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
+        (2,1,'^SELECT',10,1);
+        LOAD MYSQL QUERY RULES TO RUNTIME;
+        SAVE MYSQL QUERY RULES TO DISK;
+        "
+        """,
+        # READs a workers (HG20), WRITEs al manager (HG10)
+        "random": f"""
+        mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
+        INSERT INTO mysql_servers(hostgroup_id,hostname,port,max_connections) VALUES
+        {workers_sql_values};
+        LOAD MYSQL SERVERS TO RUNTIME;
+        SAVE MYSQL SERVERS TO DISK;
+        "
+
+        mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
+        DELETE FROM mysql_query_rules;
+        INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
+        (1,1,'^SELECT.*FOR UPDATE',10,1),
+        (2,1,'^SELECT',20,1);
+        LOAD MYSQL QUERY RULES TO RUNTIME;
+        SAVE MYSQL QUERY RULES TO DISK;
+        "
+        """,
+    }
+
+    if strategy not in rules:
+        raise ValueError(f"Unknown strategy: {strategy}")
+
+    return base_code_proxy(manager_ip, worker_ips, mysql_user, mysql_pass) + rules[strategy]

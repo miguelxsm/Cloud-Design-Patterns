@@ -69,12 +69,17 @@ if __name__ == "__main__":
 
 
     if create_proxy:
+
         path = os.path.join(_REPO_ROOT, "deployment", "ips_info.json")
+
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
         ips = [data[key]["private_ip"] for key in data.keys() if key != 'proxy']
+
         print("private ips", ips)
-        proxy_instance = create_proxy_instance(SG_PROXY_NAME, ips)
+
+        proxy_instance = create_proxy_instance(SG_PROXY_NAME, ips, "random")
+
         print("public_ip proxy: ", proxy_instance["public_ip"])
         path = save_instance_ips({"proxy" : proxy_instance})
         print("Proxy Info saved in ", path)
