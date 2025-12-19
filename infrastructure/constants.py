@@ -27,6 +27,12 @@ def build_main_permissions(sg_proxy_id: str):
             "ToPort": 3306,
             "UserIdGroupPairs": [{"GroupId": sg_proxy_id}],
         },
+        {
+            "IpProtocol": "icmp",
+            "FromPort": 8,
+            "ToPort": -1,
+            "UserIdGroupPairs": [{"GroupId": sg_proxy_id}],
+        },
     ]
 
 IP_PERMISSIONS_PROXY = [
@@ -42,5 +48,6 @@ IP_PERMISSIONS_PROXY = [
         "ToPort": 3306,
         "IpRanges": [{"CidrIp": f"{MY_IP}/32"}],
     },
+    
 ]
 

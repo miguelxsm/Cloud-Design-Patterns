@@ -27,6 +27,16 @@ def add_self_mysql_ingress(sg_id: str):
             "UserIdGroupPairs": [{"GroupId": sg_id}],
         }]
     )
+def add_icmp_protocol_sg(sg_id:str):
+    ec2_client.authorize_security_group_ingress(
+        GroupId=sg_id,
+        IpPermissions=[{
+        "IpProtocol": "icmp",
+        "FromPort": 8,
+        "ToPort": -1,
+        "UserIdGroupPairs": [{"GroupId": sg_id}],  # aquí necesitas tener sg_proxy_id disponible
+    },]
+    )
 
 def create_security_group(SECURITY_GROUP_NAME, PERMISSIONS, DESCRIPTION, VPC_ID):
     resp = ec2_client.describe_security_groups(

@@ -4,7 +4,7 @@ import json
 import requests
 import pathlib
 import argparse
-from infrastructure.create_security_group import create_security_group, add_self_mysql_ingress
+from infrastructure.create_security_group import create_security_group, add_self_mysql_ingress, add_icmp_protocol_sg
 from infrastructure.destroy_infrastructure import destroy_all
 from infrastructure.constants import SG_MAIN_NAME, build_main_permissions, SG_PROXY_NAME, IP_PERMISSIONS_PROXY, _REPO_ROOT
 from infrastructure.create_instances import create_main_instances, create_proxy_instance
@@ -22,7 +22,7 @@ if __name__ == "__main__":
     parser.add_argument("--instances", action="store_true", help="Create main instances")
     parser.add_argument("--proxy", action="store_true", help="Create proxy instance")
     parser.add_argument("--destroy", action="store_true", help="Destroy Infrastructure")
-
+    parser.add_argument("--strategy",choices=["customized", "directhit", "random"], default="directhit")
 
     args = parser.parse_args()
 
@@ -51,6 +51,9 @@ if __name__ == "__main__":
             DESCRIPTION="Proxy security Group",
             VPC_ID=vpc_id
         )
+
+        add_icmp_protocol_sg(sg_proxy)
+
         print("--- CREATING SECURITY GROUP FOR MAIN ---")
         
         sg_main = create_security_group(
@@ -61,6 +64,7 @@ if __name__ == "__main__":
             )
         
         add_self_mysql_ingress(sg_main)
+
         
     if create_instances:
         instances = create_main_instances(SG_MAIN_NAME)
@@ -77,8 +81,9 @@ if __name__ == "__main__":
         ips = [data[key]["private_ip"] for key in data.keys() if key != 'proxy']
 
         print("private ips", ips)
-
-        proxy_instance = create_proxy_instance(SG_PROXY_NAME, ips, "random")
+        
+        print("Strategy: ", args.strategy)
+        proxy_instance = create_proxy_instance(SG_PROXY_NAME, ips, args.strategy)
 
         print("public_ip proxy: ", proxy_instance["public_ip"])
         path = save_instance_ips({"proxy" : proxy_instance})

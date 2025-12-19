@@ -1,3 +1,6 @@
+import textwrap
+
+
 def _ensure_mysqld_option_block(option_lines: str) -> str:
     """
     Helper: returns a bash snippet that ensures each line in option_lines exists
@@ -233,41 +236,126 @@ def build_proxysql_user_data(
     worker_ips: list[str],
     mysql_user: str = "proxyuser",
     mysql_pass: str = "proxypass",
-    strategy: str = "direct_hit",
+    strategy: str = "directhit",
+    ping_period_sec: int = 5
 ) -> str:
     workers_sql_values = ", ".join([f"(20,'{ip}',3306,200)" for ip in worker_ips])
-    rules = {
-        # TODO al manager
-        "direct_hit": r"""
-        mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
-        DELETE FROM mysql_query_rules;
-        INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
-        (2,1,'^SELECT',10,1);
-        LOAD MYSQL QUERY RULES TO RUNTIME;
-        SAVE MYSQL QUERY RULES TO DISK;
-        "
-        """,
-        # READs a workers (HG20), WRITEs al manager (HG10)
-        "random": f"""
-        mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
-        INSERT INTO mysql_servers(hostgroup_id,hostname,port,max_connections) VALUES
-        {workers_sql_values};
-        LOAD MYSQL SERVERS TO RUNTIME;
-        SAVE MYSQL SERVERS TO DISK;
-        "
 
-        mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
-        DELETE FROM mysql_query_rules;
-        INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
-        (1,1,'^SELECT.*FOR UPDATE',10,1),
-        (2,1,'^SELECT',20,1);
-        LOAD MYSQL QUERY RULES TO RUNTIME;
-        SAVE MYSQL QUERY RULES TO DISK;
-        "
-        """,
-    }
+    rules_direct = r"""
+    mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
+    DELETE FROM mysql_query_rules;
+    INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
+    (1,1,'^SELECT',10,1);
+    LOAD MYSQL QUERY RULES TO RUNTIME;
+    SAVE MYSQL QUERY RULES TO DISK;
+    "
+    """
 
-    if strategy not in rules:
+    rules_rw_split = r"""
+    mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
+    DELETE FROM mysql_query_rules;
+    INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
+    (1,1,'^SELECT.*FOR UPDATE',10,1),
+    (2,1,'^SELECT',20,1);
+    LOAD MYSQL QUERY RULES TO RUNTIME;
+    SAVE MYSQL QUERY RULES TO DISK;
+    "
+    """
+
+    servers_with_workers = f"""
+    mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e "
+    DELETE FROM mysql_servers;
+    INSERT INTO mysql_servers(hostgroup_id,hostname,port,max_connections) VALUES
+    (10,'{manager_ip}',3306,200),
+    {workers_sql_values};
+    LOAD MYSQL SERVERS TO RUNTIME;
+    SAVE MYSQL SERVERS TO DISK;
+    "
+    """
+
+    controller = f"""#!/bin/bash
+set -euo pipefail
+
+ADMIN_HOST="127.0.0.1"
+ADMIN_PORT="6032"
+ADMIN_USER="admin"
+ADMIN_PASS="admin"
+
+PERIOD="{ping_period_sec}"
+WORKERS=({" ".join(worker_ips)})
+
+while true; do
+  best_ip=""
+  best_ms=999999
+
+  for ip in "${{WORKERS[@]}}"; do
+    out="$(ping -c 1 -W 1 "$ip" 2>/dev/null || true)"
+    ms="$(echo "$out" | sed -n 's/.*time=\\([0-9.]*\\).*/\\1/p' | head -n1)"
+    [ -z "$ms" ] && continue
+
+    better="$(awk -v a="$ms" -v b="$best_ms" 'BEGIN {{ if (a+0 < b+0) print 1; else print 0 }}')"
+    if [ "$better" = "1" ]; then
+      best_ms="$ms"
+      best_ip="$ip"
+    fi
+  done
+
+  if [ -z "$best_ip" ]; then
+    sleep "$PERIOD"
+    continue
+  fi
+
+  sql="UPDATE mysql_servers SET weight = CASE hostname"
+  for ip in "${{WORKERS[@]}}"; do
+    if [ "$ip" = "$best_ip" ]; then
+      sql="$sql WHEN '$ip' THEN 1000"
+    else
+      sql="$sql WHEN '$ip' THEN 1"
+    fi
+  done
+  sql="$sql END WHERE hostgroup_id=20;"
+
+  mysql -u "$ADMIN_USER" -p"$ADMIN_PASS" -h "$ADMIN_HOST" -P "$ADMIN_PORT" -e "$sql
+LOAD MYSQL SERVERS TO RUNTIME;
+"
+
+  sleep "$PERIOD"
+done
+"""
+
+    controller_install = textwrap.dedent(f"""\
+cat > /usr/local/bin/proxysql_ping_controller.sh <<'EOC'
+{controller}
+EOC
+chmod 0755 /usr/local/bin/proxysql_ping_controller.sh
+
+cat > /etc/systemd/system/proxysql-ping-controller.service <<'EOS'
+[Unit]
+Description=ProxySQL Ping Controller (customized strategy)
+After=network-online.target proxysql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/bin/bash /usr/local/bin/proxysql_ping_controller.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOS
+
+systemctl daemon-reload
+systemctl enable --now proxysql-ping-controller.service
+""")
+
+    if strategy == "direct_hit":
+        extra = rules_direct
+    elif strategy == "random":
+        extra = servers_with_workers + rules_rw_split
+    elif strategy == "customized":
+        extra = servers_with_workers + rules_rw_split + controller_install
+    else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
-    return base_code_proxy(manager_ip, worker_ips, mysql_user, mysql_pass) + rules[strategy]
+    return base_code_proxy(manager_ip, worker_ips, mysql_user, mysql_pass) + extra
