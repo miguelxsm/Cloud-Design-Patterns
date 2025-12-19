@@ -1,9 +1,7 @@
 import os
 import boto3
-from infrastructure.constants import REGION, KEY_PAIR_NAME, SQL_USER, SQL_PASSWORD
-from tools.utils import get_code
-from deployment.setup_instances import build_proxysql_user_data, build_manager_user_data, build_workers_user_data
-
+from infrastructure.constants import REGION, KEY_PAIR_NAME, SQL_USER, SQL_PASSWORD, API_GATEWAY
+from deployment.setup_instances import build_proxysql_user_data, build_manager_user_data, build_workers_user_data, def_server_code, build_gateway_user_data
 
 ec2 = boto3.resource("ec2", region_name=REGION)
 
@@ -109,3 +107,21 @@ def create_proxy_instance(sg_proxy_name: str, instances: dict, strategy: str):
 
     return instance
 
+def create_gateway_instance(sg_gateway_name, proxy_private_ip):
+    code_server = def_server_code(
+                    api_key=API_GATEWAY,
+                    proxy_host=proxy_private_ip,
+                    proxy_port=3306,
+                    db_user=SQL_USER,
+                    db_password=SQL_PASSWORD
+    )
+
+    user_data_gateway = build_gateway_user_data(code_server)
+
+    gateway_instance = create_instance(
+                            instance_type="t2.large",
+                            sg_id=sg_gateway_name,
+                            role_tag="gateway",
+                            user_data=user_data_gateway
+    )
+    return gateway_instance

@@ -1,0 +1,88 @@
+1) Terminal A (en el proxy) — ver pesos en tiempo real
+
+watch -n 0.1 "sudo mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e \
+\"SELECT hostgroup_id, hostname, weight, status
+  FROM runtime_mysql_servers
+  WHERE hostgroup_id IN (10,20)
+  ORDER BY hostgroup_id, hostname;\""
+
+2) Terminal B (en el proxy) — ver queries por backend en tiempo real
+
+watch -n 0.1 "sudo mysql -u admin -padmin -h 127.0.0.1 -P 6032 -e \
+\"SELECT hostgroup, srv_host, status, ConnUsed, ConnFree, Queries
+  FROM stats.stats_mysql_connection_pool
+  ORDER BY hostgroup, srv_host;\""
+
+  for j in $(seq 1 10); do
+  (for i in $(seq 1 300); do
+     mysql -h 100.31.139.167 -P 3306 -u mysqluser -pmysqlpassword -e "SELECT 1;" >/dev/null
+   done) &
+done
+wait
+
+
+En tu caso (Ubuntu + systemd), este es el comando clave y es el que debes memorizar:
+
+journalctl -u gatekeeper -n 200 --no-pager
+
+Qué hace exactamente
+
+-u gatekeeper → muestra solo los logs del servicio gatekeeper.service
+
+-n 200 → últimas 200 líneas
+
+--no-pager → salida directa (sin less)
+
+Comandos útiles según lo que quieras ver
+1) Ver si el servicio arrancó o falló
+systemctl status gatekeeper
+
+
+Te dirá:
+
+active (running) → OK
+
+failed / exited → algo petó (syntax error, import error, etc.)
+
+2) Ver logs en tiempo real (muy útil)
+journalctl -u gatekeeper -f
+
+
+Déjalo abierto mientras haces un curl.
+
+3) Ver errores de instalación (user-data / cloud-init)
+
+Si ni siquiera existe el servicio:
+
+sudo journalctl -u cloud-init --no-pager | tail -n 200
+
+
+o más directo:
+
+sudo cat /var/log/cloud-init-output.log
+
+
+Ahí verás:
+
+errores de apt-get
+
+errores de pip install
+
+errores al escribir server.py
+
+errores al crear el unit file
+
+4) Ver si FastAPI/uvicorn está escuchando
+ss -lntp | grep 80
+
+
+o:
+
+curl http://127.0.0.1/health
+
+
+
+curl -X POST http://54.167.32.143/query \
+  -H "X-API-Key: MY_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"SELECT * FROM sakila.actor"}'

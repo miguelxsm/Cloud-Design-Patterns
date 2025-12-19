@@ -1,4 +1,5 @@
 import textwrap
+import base64
 
 
 def _ensure_mysqld_option_block(option_lines: str) -> str:
@@ -482,7 +483,7 @@ systemctl daemon-reload
 systemctl enable --now proxysql-ping-controller.service
 """)
 
-    if strategy == "direct_hit":
+    if strategy == "directhit":
         extra = rules_direct
     elif strategy == "random":
         extra = servers_with_workers + rules_rw_split
@@ -492,3 +493,333 @@ systemctl enable --now proxysql-ping-controller.service
         raise ValueError(f"Unknown strategy: {strategy}")
 
     return base_code_proxy(manager_ip, worker_ips, mysql_user, mysql_pass) + extra
+
+def def_server_code(api_key, proxy_host, proxy_port, db_user, db_password) -> str:
+    template = r'''from __future__ import annotations
+
+import os
+import re
+import time
+import logging
+from typing import Any, Optional, List, Dict, Tuple
+
+from fastapi import FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, Field
+
+import mysql.connector
+from mysql.connector import pooling, Error as MySQLError
+
+
+# ----------------------------
+# Config (inlined from user-data)
+# ----------------------------
+API_KEY = {API_KEY!r}
+PROXY_HOST = {PROXY_HOST!r}
+PROXY_PORT = int({PROXY_PORT})
+DB_USER = {DB_USER!r}
+DB_PASSWORD = {DB_PASSWORD!r}
+
+DB_NAME = None
+
+MAX_ROWS = 500
+MAX_RESULT_BYTES = 2_000_000
+
+# Pool sizing
+POOL_NAME = os.environ.get("POOL_NAME", "gatekeeper_pool")
+POOL_SIZE = int(os.environ.get("POOL_SIZE", "10"))
+POOL_RESET_SESSION = os.environ.get("POOL_RESET_SESSION", "true").lower() in ("1", "true", "yes")
+
+# Policy: allowlist toggle
+STRICT_ALLOWLIST = os.environ.get("STRICT_ALLOWLIST", "true").lower() in ("1", "true", "yes")
+
+# Logging
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("gatekeeper")
+
+DENY_REGEX = re.compile(
+    r"""
+    \b(
+        DROP
+        |TRUNCATE
+        |ALTER
+        |GRANT
+        |REVOKE
+        |CREATE\s+USER
+        |CREATE\s+ROLE
+        |SET\s+PASSWORD
+        |SHUTDOWN
+        |RELOAD
+        |SUPER
+        |FILE
+        |LOAD\s+DATA
+        |OUTFILE
+        |INFILE
+        |XA
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+ALLOW_TOPLEVEL = re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE)\b", re.IGNORECASE)
+
+
+def is_single_statement(sql: str) -> bool:
+    s = sql.strip()
+    if not s:
+        return False
+    if s.endswith(";"):
+        s = s[:-1].rstrip()
+    return ";" not in s
+
+
+def normalize_sql(sql: str) -> str:
+    return sql.strip()
+
+
+def validate_query(sql: str) -> None:
+    s = normalize_sql(sql)
+    if not s:
+        raise HTTPException(status_code=400, detail="empty query")
+    if not is_single_statement(s):
+        raise HTTPException(status_code=403, detail="query rejected: multiple statements")
+    if DENY_REGEX.search(s):
+        raise HTTPException(status_code=403, detail="query rejected: forbidden keyword")
+    if STRICT_ALLOWLIST and not ALLOW_TOPLEVEL.match(s):
+        raise HTTPException(status_code=403, detail="query rejected: statement not allowed")
+    if len(s) > 50_000:
+        raise HTTPException(status_code=413, detail="query too large")
+
+
+def classify_query(sql: str) -> str:
+    s = normalize_sql(sql).lstrip()
+    m = re.match(r"^(SELECT|INSERT|UPDATE|DELETE)\b", s, flags=re.IGNORECASE)
+    return m.group(1).lower() if m else "other"
+
+
+class QueryRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=50_000)
+
+
+class SelectResponse(BaseModel):
+    type: str = "select"
+    columns: List[str]
+    rows: List[List[Any]]
+    row_count: int
+    truncated: bool
+
+
+class WriteResponse(BaseModel):
+    type: str = "write"
+    affected_rows: int
+
+
+app = FastAPI(title="DB Gatekeeper", version="1.0")
+_pool: Optional[pooling.MySQLConnectionPool] = None
+
+
+def require_env() -> None:
+    missing = []
+    if not API_KEY: missing.append("API_KEY")
+    if not PROXY_HOST: missing.append("PROXY_HOST")
+    if not DB_USER: missing.append("DB_USER")
+    if not DB_PASSWORD: missing.append("DB_PASSWORD")
+    if missing:
+        raise RuntimeError("Missing required values: " + ", ".join(missing))
+
+
+def create_pool() -> pooling.MySQLConnectionPool:
+    require_env()
+    conn_kwargs = dict(
+        host=PROXY_HOST,
+        port=PROXY_PORT,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        autocommit=True,
+        connection_timeout=5,
+    )
+    if DB_NAME:
+        conn_kwargs["database"] = DB_NAME
+
+    return mysql.connector.pooling.MySQLConnectionPool(
+        pool_name=POOL_NAME,
+        pool_size=POOL_SIZE,
+        pool_reset_session=POOL_RESET_SESSION,
+        **conn_kwargs,
+    )
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    global _pool
+    _pool = create_pool()
+    log.info("Gatekeeper started. proxy=%s:%s pool_size=%s", PROXY_HOST, PROXY_PORT, POOL_SIZE)
+
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    try:
+        assert _pool is not None
+        cnx = _pool.get_connection()
+        try:
+            cur = cnx.cursor()
+            cur.execute("SELECT 1")
+            _ = cur.fetchone()
+        finally:
+            cnx.close()
+        return {{"ok": True}}
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"unhealthy: {{e}}")
+
+
+def auth_or_401(x_api_key: Optional[str]) -> None:
+    if not x_api_key or x_api_key != API_KEY:
+        raise HTTPException(status_code=401, detail="unauthorized")
+
+
+def fetch_all_limited(cur) -> Tuple[List[str], List[List[Any]], bool]:
+    columns = [desc[0] for desc in (cur.description or [])]
+    rows: List[List[Any]] = []
+    truncated = False
+    approx_bytes = 0
+
+    for _ in range(MAX_ROWS + 1):
+        row = cur.fetchone()
+        if row is None:
+            break
+        if len(rows) >= MAX_ROWS:
+            truncated = True
+            break
+
+        row_list = list(row)
+        rows.append(row_list)
+
+        approx_bytes += sum(len(str(v)) for v in row_list)
+        if approx_bytes > MAX_RESULT_BYTES:
+            truncated = True
+            break
+
+    return columns, rows, truncated
+
+
+@app.post("/query", response_model=Any)
+def query_endpoint(
+    req: QueryRequest,
+    request: Request,
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+) -> Any:
+    auth_or_401(x_api_key)
+
+    sql = req.query
+    validate_query(sql)
+
+    qtype = classify_query(sql)
+    start = time.time()
+
+    try:
+        assert _pool is not None
+        cnx = _pool.get_connection()
+        try:
+            cur = cnx.cursor()
+            cur.execute(sql)
+
+            if qtype == "select":
+                cols, rows, truncated = fetch_all_limited(cur)
+                return SelectResponse(columns=cols, rows=rows, row_count=len(rows), truncated=truncated)
+
+            affected = cur.rowcount if cur.rowcount is not None else 0
+            return WriteResponse(affected_rows=int(affected))
+        finally:
+            cnx.close()
+
+    except HTTPException:
+        raise
+    except MySQLError as e:
+        msg = str(e)
+        if "Can't connect" in msg or "Connection refused" in msg or "timeout" in msg.lower():
+            raise HTTPException(status_code=502, detail="upstream database unavailable")
+        raise HTTPException(status_code=400, detail=f"sql error: {{msg}}")
+    except Exception:
+        raise HTTPException(status_code=500, detail="internal error")
+'''
+
+    # Sustitución segura SOLO de los 5 parámetros (sin tocar llaves del código)
+    # Usamos repr() para que queden strings Python válidos con comillas.
+    return template.format(
+        API_KEY=api_key,
+        PROXY_HOST=proxy_host,
+        PROXY_PORT=int(proxy_port),
+        DB_USER=db_user,
+        DB_PASSWORD=db_password,
+    )
+
+def build_gateway_user_data(
+    server_code: str,
+    listen_port: int = 80,
+    app_dir: str = "/opt/gatekeeper",
+    service_name: str = "gatekeeper",
+) -> str:
+    
+    code_b64 = base64.b64encode(server_code.encode("utf-8")).decode("ascii")
+
+    systemd_unit = f"""\
+[Unit]
+Description=FastAPI Gatekeeper
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory={app_dir}
+ExecStart=/opt/gatekeeper/venv/bin/python -m uvicorn server:app --host 0.0.0.0 --port {listen_port}
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
+    user_data = f"""#!/bin/bash
+set -euxo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update -y
+apt-get install -y python3 python3-venv python3-pip ca-certificates curl
+
+mkdir -p /opt/gatekeeper
+cd /opt/gatekeeper
+
+# Crear virtualenv
+python3 -m venv venv
+
+# Activar venv
+source venv/bin/activate
+
+# Instalar dependencias dentro del venv
+pip install --upgrade pip
+pip install fastapi uvicorn mysql-connector-python
+
+
+# Escribir app
+mkdir -p {app_dir}
+echo "{code_b64}" | base64 -d > {app_dir}/server.py
+
+# Systemd service
+cat > /etc/systemd/system/{service_name}.service <<'EOS'
+{systemd_unit}
+EOS
+
+systemctl daemon-reload
+systemctl enable --now {service_name}
+
+# Smoke check local
+sleep 2
+curl -fsS http://127.0.0.1:{listen_port}/health || (journalctl -u {service_name} -n 200 --no-pager; exit 1)
+"""
+
+    return textwrap.dedent(user_data)
