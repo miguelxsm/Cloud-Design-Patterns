@@ -237,7 +237,7 @@ def build_proxysql_user_data(
     mysql_user: str = "proxyuser",
     mysql_pass: str = "proxypass",
     strategy: str = "directhit",
-    ping_period_sec: int = 5
+    ping_period_sec: int = 1
 ) -> str:
     workers_sql_values = ", ".join([f"(20,'{ip}',3306,200)" for ip in worker_ips])
 
@@ -282,46 +282,179 @@ ADMIN_USER="admin"
 ADMIN_PASS="admin"
 
 PERIOD="{ping_period_sec}"
+
+# Parámetros de estabilidad
+K_PINGS=3                 # mediana de k pings por ciclo
+ALPHA="0.2"               # EMA alpha (0.1..0.3)
+EPS_MS="0.1"              # epsilon en ms para evitar división rara
+W_MIN=1
+W_MAX=100
+DELTA_MAX=10              # rate limit: cambio máximo de weight por ciclo
+
+# Workers
 WORKERS=({" ".join(worker_ips)})
 
-while true; do
-  best_ip=""
-  best_ms=999999
+# Estado EMA y pesos previos (associative arrays)
+declare -A EMA
+declare -A WPREV
 
-  for ip in "${{WORKERS[@]}}"; do
+# Inicialización: EMA grande y pesos en valor medio
+INIT_EMA="100.0"
+INIT_W=$(( (W_MIN + W_MAX) / 2 ))
+for ip in "${{WORKERS[@]}}"; do
+  EMA["$ip"]="$INIT_EMA"
+  WPREV["$ip"]="$INIT_W"
+done
+
+median3() {{
+  # median of 3 numbers (strings) using sort
+  printf "%s\\n%s\\n%s\\n" "$1" "$2" "$3" | sort -n | sed -n '2p'
+}}
+
+measure_rtt_ms() {{
+  # Devuelve rtt en ms como float (string). Si falla, devuelve vacío.
+  local ip="$1"
+  local vals=()
+
+  local n=0
+  while [ "$n" -lt "$K_PINGS" ]; do
     out="$(ping -c 1 -W 1 "$ip" 2>/dev/null || true)"
     ms="$(echo "$out" | sed -n 's/.*time=\\([0-9.]*\\).*/\\1/p' | head -n1)"
-    [ -z "$ms" ] && continue
-
-    better="$(awk -v a="$ms" -v b="$best_ms" 'BEGIN {{ if (a+0 < b+0) print 1; else print 0 }}')"
-    if [ "$better" = "1" ]; then
-      best_ms="$ms"
-      best_ip="$ip"
+    if [ -n "$ms" ]; then
+      vals+=("$ms")
+      n=$((n+1))
+    else
+      # si un ping falla, no lo contamos; evitamos sesgo a 0
+      n=$((n+1))
+      vals+=("")
     fi
   done
 
-  if [ -z "$best_ip" ]; then
+  # Filtrar vacíos
+  local clean=()
+  for v in "${{vals[@]}}"; do
+    [ -n "$v" ] && clean+=("$v")
+  done
+
+  if [ "${{#clean[@]}}" -eq 0 ]; then
+    echo ""
+    return 0
+  fi
+
+  if [ "${{#clean[@]}}" -eq 1 ]; then
+    echo "${{clean[0]}}"
+    return 0
+  fi
+
+  if [ "${{#clean[@]}}" -eq 2 ]; then
+    # mediana de 2 -> media simple (suave y barata)
+    awk -v a="${{clean[0]}}" -v b="${{clean[1]}}" 'BEGIN {{ printf "%.6f", (a+b)/2.0 }}'
+    return 0
+  fi
+
+  # >=3: usamos mediana de 3 primeros (K_PINGS=3 recomendado)
+  echo "$(median3 "${{clean[0]}}" "${{clean[1]}}" "${{clean[2]}}")"
+}}
+
+clip_int() {{
+  # clip_int value min max
+  local v="$1"; local lo="$2"; local hi="$3"
+  if [ "$v" -lt "$lo" ]; then echo "$lo"; return; fi
+  if [ "$v" -gt "$hi" ]; then echo "$hi"; return; fi
+  echo "$v"
+}}
+
+while true; do
+  # 1) medir RTT robusto y actualizar EMA
+  declare -A RTT
+  declare -A SCORE
+
+  for ip in "${{WORKERS[@]}}"; do
+    rtt="$(measure_rtt_ms "$ip")"
+    if [ -z "$rtt" ]; then
+      # Si no hay medida, no tocamos EMA; penalizamos con EMA actual
+      rtt="${{EMA[$ip]}}"
+    fi
+    RTT["$ip"]="$rtt"
+
+    prev="${{EMA[$ip]}}"
+    new_ema="$(awk -v a="$ALPHA" -v r="$rtt" -v p="$prev" 'BEGIN {{ printf "%.6f", a*r + (1.0-a)*p }}')"
+    EMA["$ip"]="$new_ema"
+  done
+
+  # 2) latencia->score: s_i = 1/(ema_i + eps)
+  sum_scores="0.0"
+  for ip in "${{WORKERS[@]}}"; do
+    e="${{EMA[$ip]}}"
+    s="$(awk -v e="$e" -v eps="$EPS_MS" 'BEGIN {{ printf "%.12f", 1.0/(e+eps) }}')"
+    SCORE["$ip"]="$s"
+    sum_scores="$(awk -v x="$sum_scores" -v y="$s" 'BEGIN {{ printf "%.12f", x+y }}')"
+  done
+
+  # Si sum_scores es 0 (muy improbable), saltar
+  zero="$(awk -v s="$sum_scores" 'BEGIN {{ if (s<=0.0) print 1; else print 0 }}')"
+  if [ "$zero" = "1" ]; then
     sleep "$PERIOD"
     continue
   fi
 
-  sql="UPDATE mysql_servers SET weight = CASE hostname"
+  # 3) score->peso: w_i* = wmin + (wmax-wmin)*(s_i/sum)
+  declare -A WSTAR
   for ip in "${{WORKERS[@]}}"; do
-    if [ "$ip" = "$best_ip" ]; then
-      sql="$sql WHEN '$ip' THEN 1000"
-    else
-      sql="$sql WHEN '$ip' THEN 1"
+    s="${{SCORE[$ip]}}"
+    w="$(awk -v wmin="$W_MIN" -v wmax="$W_MAX" -v si="$s" -v sum="$sum_scores" '
+      BEGIN {{
+        v = wmin + (wmax-wmin)*(si/sum);
+        # redondeo al entero más cercano
+        if (v>=0) printf "%d", int(v+0.5); else printf "%d", int(v-0.5);
+      }}')"
+    # asegurar rango
+    w="$(clip_int "$w" "$W_MIN" "$W_MAX")"
+    WSTAR["$ip"]="$w"
+  done
+
+  # 4) rate limiting: w(t)=w(t-1)+clip(w*-wprev, -DELTA, +DELTA)
+  declare -A WNEW
+  for ip in "${{WORKERS[@]}}"; do
+    prev="${{WPREV[$ip]}}"
+    target="${{WSTAR[$ip]}}"
+    delta=$(( target - prev ))
+    if [ "$delta" -gt "$DELTA_MAX" ]; then delta="$DELTA_MAX"; fi
+    if [ "$delta" -lt $(( -DELTA_MAX )) ]; then delta=$(( -DELTA_MAX )); fi
+    new=$(( prev + delta ))
+    new="$(clip_int "$new" "$W_MIN" "$W_MAX")"
+    WNEW["$ip"]="$new"
+  done
+
+  # 5) aplicar UPDATE en ProxySQL solo si hay cambios
+  changed=0
+  for ip in "${{WORKERS[@]}}"; do
+    if [ "${{WNEW[$ip]}}" -ne "${{WPREV[$ip]}}" ]; then
+      changed=1
+      break
     fi
   done
-  sql="$sql END WHERE hostgroup_id=20;"
 
-  mysql -u "$ADMIN_USER" -p"$ADMIN_PASS" -h "$ADMIN_HOST" -P "$ADMIN_PORT" -e "$sql
+  if [ "$changed" = "1" ]; then
+    sql="UPDATE mysql_servers SET weight = CASE hostname"
+    for ip in "${{WORKERS[@]}}"; do
+      sql="$sql WHEN '$ip' THEN ${{WNEW[$ip]}}"
+    done
+    sql="$sql END WHERE hostgroup_id=20;"
+
+    mysql -u "$ADMIN_USER" -p"$ADMIN_PASS" -h "$ADMIN_HOST" -P "$ADMIN_PORT" -e "$sql
 LOAD MYSQL SERVERS TO RUNTIME;
 "
+
+    for ip in "${{WORKERS[@]}}"; do
+      WPREV["$ip"]="${{WNEW[$ip]}}"
+    done
+  fi
 
   sleep "$PERIOD"
 done
 """
+
 
     controller_install = textwrap.dedent(f"""\
 cat > /usr/local/bin/proxysql_ping_controller.sh <<'EOC'
