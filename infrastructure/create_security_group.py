@@ -34,7 +34,7 @@ def add_icmp_protocol_sg(sg_id:str):
         "IpProtocol": "icmp",
         "FromPort": 8,
         "ToPort": -1,
-        "UserIdGroupPairs": [{"GroupId": sg_id}],  # aquí necesitas tener sg_proxy_id disponible
+        "UserIdGroupPairs": [{"GroupId": sg_id}],  
     },]
     )
 

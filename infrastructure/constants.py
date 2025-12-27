@@ -12,8 +12,6 @@ MY_IP = requests.get('https://ifconfig.me', timeout=5).text.strip()
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 KEY_PAIR_NAME =  "mainkey"
 
-
-
 API_GATEWAY = "MY_API_KEY"
 SQL_USER = "mysqluser"
 SQL_PASSWORD = "mysqlpassword"

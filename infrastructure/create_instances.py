@@ -96,7 +96,7 @@ def create_proxy_instance(sg_proxy_name: str, instances: dict, strategy: str):
         mysql_user=SQL_USER,
         mysql_pass=SQL_PASSWORD,
         strategy=strategy
-        )
+    )
     
     instance = create_instance(
         instance_type="t2.large",
