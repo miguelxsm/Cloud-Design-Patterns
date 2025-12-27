@@ -1,0 +1,868 @@
+\documentclass[11pt,a4paper]{article}
+
+% --------------------
+% Packages
+% --------------------
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{geometry}
+\geometry{margin=2.5cm}
+
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{hyperref}
+\usepackage{booktabs}
+
+\usepackage{listings}
+\usepackage{xcolor}
+
+% --------------------
+% Listings configuration
+% --------------------
+\lstset{
+	basicstyle=\ttfamily\small,
+	backgroundcolor=\color{gray!10},
+	frame=single,
+	breaklines=true,
+	columns=fullflexible,
+	showstringspaces=false,
+	captionpos=b
+}
+
+% --------------------
+% Document
+% --------------------
+\begin{document}
+	\begin{titlepage}
+		\centering
+		\vspace*{\fill}
+		{\Huge \textbf{Cloud Design Patterns: MySQL Cluster with Proxy and Gatekeeper} \par} 
+		\vspace{1.5cm}
+		{\Large École Polytechnique de Montréal} \\
+		[0.5cm]{\Large Advanced Concepts of Cloud Computing} \\ [0.5cm]
+		
+		{\Large \textbf{LOG8415E}} \\
+		\vspace*{0.5cm}
+		{\Large 2025 - 2026}  \\
+		\vspace{1.5cm}
+		{\Large \textbf{Miguel Carrasco Guirao} \par}
+		\vspace{2cm}
+		\includegraphics[width=0.5\textwidth]{figures/logo_polytecnique.png}
+		\vspace*{\fill}
+		\vspace{1cm}
+		\date{}
+	\end{titlepage}
+	
+	\section*{Code}
+	
+	The code of the assignment can be found on the following repository: \\ \href{https://github.com/miguelxsm/Cloud-Design-Patterns}{https://github.com/miguelxsm/Cloud-Design-Patterns}
+	
+	\section{Benchmarking MySQL with Sysbench}
+	
+	Before deploying the distributed MySQL cluster and applying the Proxy and Gatekeeper patterns, each database instance was validated in standalone mode.  
+	The goal of this step is to ensure that MySQL is correctly installed, operational, and capable of handling basic workloads, as required by the assignment specification.
+	
+	\subsection{Setup and Execution Procedure}
+	
+	Once the EC2 instances were launched and MySQL together with the Sakila database was installed, the validation was performed by connecting to each instance via SSH and executing \texttt{sysbench} locally.
+	
+	First, \texttt{sysbench} was installed on the instance:
+	
+	\begin{lstlisting}[language=bash]
+		sudo apt-get install -y sysbench
+	\end{lstlisting}
+	
+	After installation, the database was prepared for benchmarking using the read-only OLTP workload provided by sysbench.  
+	The preparation step creates auxiliary tables used internally by the benchmark:
+	
+	\begin{lstlisting}[language=bash]
+		sudo sysbench /usr/share/sysbench/oltp_read_only.lua \
+		--mysql-db=sakila \
+		--mysql-user=mysqluser \
+		--mysql-password=mysqlpassword \
+		prepare
+	\end{lstlisting}
+	
+	Finally, the benchmark was executed:
+	
+	\begin{lstlisting}[language=bash]
+		sudo sysbench /usr/share/sysbench/oltp_read_only.lua \
+		--mysql-db=sakila \
+		--mysql-user=mysqluser \
+		--mysql-password=mysqlpassword \
+		run
+	\end{lstlisting}
+	
+	\subsection{Observed Results}
+	
+	The execution completed successfully on all instances.  
+	An excerpt of the output is shown below:
+	
+	\begin{lstlisting}
+		transactions:                        8068   (806.50 per sec.)
+		queries:                             129088 (12904.05 per sec.)
+		
+		Latency (ms):
+		avg:                              1.24
+		95th percentile:                 2.00
+	\end{lstlisting}
+	
+	These results confirm that each MySQL instance is functioning correctly and is able to sustain a stable workload with low latency in standalone mode.  
+	This validation step provides a reliable baseline before enabling replication and introducing the Proxy and Gatekeeper patterns.
+	
+	\section{Proxy Pattern}
+	
+	This section describes the implementation of the \emph{Proxy} pattern (read/write routing and load distribution) using ProxySQL as the single internal entry point to the MySQL cluster.
+	
+	\subsection{Proxy Security Group Permissions}
+	
+	The ProxySQL instance is treated as an internal \emph{Trusted Host}. Therefore, inbound connectivity is restricted to the minimum set required for operation and maintenance:
+	
+	\begin{itemize}
+		\item \textbf{SSH (22/tcp)} is allowed only from the operator IP (\texttt{MY\_IP/32}) for administration.
+		\item \textbf{MySQL frontend (3306/tcp)} is allowed only from:
+		\begin{itemize}
+			\item the operator IP (\texttt{MY\_IP/32}) for debugging/validation when needed, and
+			\item the Gatekeeper Security Group (source = \texttt{sg\_gateway\_id}), so that \emph{all} application traffic reaches the database through the Gatekeeper first.
+		\end{itemize}
+	\end{itemize}
+	
+	\noindent The corresponding inbound rules are:
+	
+	\begin{lstlisting}[language=python]
+		def build_proxy_permissions(sg_gateway_id):
+		return [
+		{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22,
+			"IpRanges": [{"CidrIp": f"{MY_IP}/32"}]},
+		{"IpProtocol": "tcp", "FromPort": 3306, "ToPort": 3306,
+			"IpRanges": [{"CidrIp": f"{MY_IP}/32"}]},
+		{"IpProtocol": "tcp", "FromPort": 3306, "ToPort": 3306,
+			"UserIdGroupPairs": [{"GroupId": sg_gateway_id}]},
+		]
+	\end{lstlisting}
+	
+	\noindent This configuration enforces the intended topology: Internet traffic reaches only the Gatekeeper, and only validated requests are forwarded to the Proxy (Trusted Host). Direct access to the database nodes is not permitted.
+	
+	\subsection{ProxySQL Setup and Routing Model}
+	
+	ProxySQL is installed and configured to:
+	\begin{itemize}
+		\item expose a MySQL-compatible frontend on \textbf{3306/tcp} for client connections (used by the Gatekeeper),
+		\item expose an admin interface on \textbf{6032/tcp} (loopback only) for configuration and runtime updates,
+		\item maintain two \texttt{hostgroups}: \textbf{10} for the manager, and \textbf{20} for the workers.
+	\end{itemize}
+	
+	\noindent The base provisioning installs ProxySQL, moves the frontend port to 3306, resets the internal database, and configures the manager backend and the application user:
+	
+	\begin{lstlisting}[language=bash]
+		# Install ProxySQL and set frontend to 3306
+		apt-get install -y proxysql
+		sed -i 's/interfaces="0.0.0.0:6033"/interfaces="0.0.0.0:3306"/' /etc/proxysql.cnf || true
+		
+		# Reset ProxySQL state and start
+		rm -f /var/lib/proxysql/proxysql.db || true
+		systemctl start proxysql
+		
+		# Configure manager backend (hostgroup 10)
+		INSERT INTO mysql_servers(hostgroup_id,hostname,port,max_connections)
+		VALUES (10,'<MANAGER_PRIVATE_IP>',3306,200);
+		
+		# Configure application user
+		INSERT INTO mysql_users(username,password,default_hostgroup)
+		VALUES ('<MYSQL_USER>','<MYSQL_PASS>',10);
+	\end{lstlisting}
+	
+	\noindent Read/write routing is implemented via query rules:
+	\begin{itemize}
+		\item \textbf{WRITE operations} and \texttt{SELECT ... FOR UPDATE} are routed to the manager (hostgroup 10).
+		\item \textbf{READ-only SELECT} statements are routed to workers (hostgroup 20) when a worker pool is enabled.
+	\end{itemize}
+	
+	\subsection{Forwarding Strategies}
+	
+	The proxy must support three forwarding strategies: \textit{Direct Hit}, \textit{Random}, and \textit{Customized}. The strategy is selected at provisioning time through the \texttt{strategy} parameter of the ProxySQL user-data.
+	
+	\subsubsection{Direct Hit}
+	
+	In the \textit{Direct Hit} strategy, all traffic is forwarded to the manager node regardless of query type. This provides a baseline with no read scaling.
+	
+	\begin{lstlisting}[language=sql]
+		INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply)
+		VALUES (1,1,'^SELECT',10,1);
+		LOAD MYSQL QUERY RULES TO RUNTIME;
+		SAVE MYSQL QUERY RULES TO DISK;
+	\end{lstlisting}
+	
+	\noindent Since no workers are configured for routing in this strategy, reads are not distributed and the proxy behaves as a pure pass-through to the manager.
+	
+	\subsubsection{Random}
+	
+	In the \textit{Random} strategy, a worker pool is enabled in hostgroup 20 and read/write splitting is activated. The worker nodes are inserted with equal weights so that ProxySQL distributes reads evenly (round-robin over equally weighted servers).
+	
+	\paragraph{Backends (manager + workers).} \noindent
+	\begin{lstlisting}[language=sql]
+		INSERT INTO mysql_servers(hostgroup_id,hostname,port,max_connections) VALUES
+		(10,'<MANAGER_PRIVATE_IP>',3306,200),
+		(20,'<WORKER1_PRIVATE_IP>',3306,200),
+		(20,'<WORKER2_PRIVATE_IP>',3306,200);
+		LOAD MYSQL SERVERS TO RUNTIME;
+		SAVE MYSQL SERVERS TO DISK;
+	\end{lstlisting}
+	
+	\paragraph{Read/Write split rules.} \noindent
+	\begin{lstlisting}[language=sql]
+		INSERT INTO mysql_query_rules(rule_id,active,match_pattern,destination_hostgroup,apply) VALUES
+		(1,1,'^SELECT.*FOR UPDATE',10,1),
+		(2,1,'^SELECT',20,1);
+		LOAD MYSQL QUERY RULES TO RUNTIME;
+		SAVE MYSQL QUERY RULES TO DISK;
+	\end{lstlisting}
+	
+	\textbf{Note: \^\ SELECT means: all queries starting with SELECT}
+	
+	\noindent With equal weights in hostgroup 20, the proxy distributes read queries across workers, while all writes (and locking reads) are routed to the manager.
+	
+	\subsubsection{Customized}
+	
+	The \textit{Customized} strategy extends the Random strategy by dynamically adjusting worker weights based on measured network latency. A controller process runs periodically (every \texttt{PERIOD} seconds) and updates the weights of workers in hostgroup 20.
+	
+	\paragraph{Controller scheduling.}
+	The controller is installed as a systemd service to ensure it is started automatically and restarted on failure:
+	
+	\begin{lstlisting}[language=bash]
+		cat > /etc/systemd/system/proxysql-ping-controller.service <<'EOS'
+		[Unit]
+		Description=ProxySQL Ping Controller (customized strategy)
+		After=network-online.target proxysql.service
+		Wants=network-online.target
+		
+		[Service]
+		Type=simple
+		ExecStart=/bin/bash /usr/local/bin/proxysql_ping_controller.sh
+		Restart=always
+		RestartSec=2
+		
+		[Install]
+		WantedBy=multi-user.target
+		EOS
+		
+		systemctl daemon-reload
+		systemctl enable --now proxysql-ping-controller.service
+	\end{lstlisting}
+	
+	\paragraph{Weight computation.}
+	Every cycle, the controller measures worker RTT using ICMP ping and applies smoothing and normalization to compute new weights:
+	
+	\begin{align}
+		\mathrm{ema}_i(t) &= \alpha \cdot \mathrm{rtt}_i(t) + (1-\alpha)\cdot \mathrm{ema}_i(t-1) \\
+		s_i &= \frac{1}{\mathrm{ema}_i + \varepsilon} \\
+		w_i &= w_{\min} + (w_{\max}-w_{\min})\frac{s_i}{\sum_j s_j}
+	\end{align}
+	
+	\noindent In addition, a per-cycle rate limit is applied to avoid abrupt weight changes (anti-flapping): the weight update is bounded by \texttt{DELTA\_MAX} per cycle.
+	
+	\paragraph{Applying weights in ProxySQL.}
+	When weights change, the controller updates the \texttt{mysql\_servers} table and loads the change at runtime:
+	
+	\begin{lstlisting}[language=sql]
+		UPDATE mysql_servers
+		SET weight = CASE hostname
+		WHEN '<WORKER1_PRIVATE_IP>' THEN <W1>
+		WHEN '<WORKER2_PRIVATE_IP>' THEN <W2>
+		END
+		WHERE hostgroup_id=20;
+		
+		LOAD MYSQL SERVERS TO RUNTIME;
+	\end{lstlisting}
+	
+	\noindent This results in a continuously adapted read distribution, where workers with lower measured latency receive proportionally higher weights. Writes remain routed to the manager via the same read/write split rules as in the Random strategy.
+	
+	\section{Gatekeeper Pattern}
+	
+	This section describes the implementation of the \emph{Gatekeeper} pattern. The Gatekeeper is the only Internet-facing component and brokers all access to storage. The ProxySQL instance acts as the \emph{Trusted Host}, meaning it only receives \emph{validated} requests from the Gatekeeper and is not directly exposed to the Internet.
+	
+	\subsection{Gatekeeper Security Group Permissions}
+	
+	The inbound rules applied to the Gatekeeper Security Group are the following:
+	
+	\begin{lstlisting}[language=python]
+		IP_PERMISSIONS_GATEWAY = [
+		{
+			"IpProtocol": "tcp",
+			"FromPort": 22,
+			"ToPort": 22,
+			"IpRanges": [{"CidrIp": f"{MY_IP}/32"}],
+		},
+		{
+			"IpProtocol": "tcp",
+			"FromPort": 80,
+			"ToPort": 80,
+			"IpRanges": [{"CidrIp": "0.0.0.0/0"}],
+		},
+		]
+	\end{lstlisting}
+	
+	\noindent These rules are justified as follows:
+	
+	\begin{itemize}
+		\item \textbf{SSH (22/tcp)} is restricted to the operator’s public IP (\texttt{MY\_IP/32}) and is used exclusively for administrative access and debugging.
+		\item \textbf{HTTP (80/tcp)} is exposed publicly (\texttt{0.0.0.0/0}) to allow users and API clients to send requests to the Gatekeeper service.
+	\end{itemize}
+	
+	\noindent No database-related ports are exposed on the Gatekeeper. In particular:
+	\begin{itemize}
+		\item the Gatekeeper does \textbf{not} accept MySQL connections,
+		\item it does \textbf{not} expose the ProxySQL frontend,
+		\item it has no direct inbound connectivity to any database node.
+	\end{itemize}
+	
+	\noindent All database access is initiated \emph{outbound} by the Gatekeeper towards the Trusted Host (ProxySQL) over the private VPC network. This strictly enforces the Gatekeeper pattern requirement that only validated requests are forwarded to internal roles, while the Gatekeeper itself remains the sole Internet-facing component.
+	
+	
+	\subsection{Gatekeeper Service: FastAPI Broker}
+	
+	A dedicated FastAPI service is deployed on the Gatekeeper instance. This service implements the brokering logic required by the assignment:
+	\begin{enumerate}
+		\item receive user/API requests over HTTP,
+		\item check authentication/authorization (simple API key, as allowed by the course staff),
+		\item validate and sanitize input queries to reject unsafe statements,
+		\item forward only validated queries to the Trusted Host (ProxySQL) through an internal channel,
+		\item return results back to the user.
+	\end{enumerate}
+	
+	
+	\subsection{User-Data Deployment (Service Installation)}
+	
+	The Gatekeeper is deployed end-to-end via instance user-data. The provisioning installs Python, creates a virtual environment, installs dependencies, writes the FastAPI application, and configures a systemd unit running Uvicorn:
+	
+	\begin{lstlisting}[language=bash]
+		apt-get install -y python3 python3-venv python3-pip ca-certificates curl
+		
+		python3 -m venv venv
+		source venv/bin/activate
+		pip install fastapi uvicorn mysql-connector-python
+		
+		# write server.py and start systemd service
+		mkdir -p {app_dir}
+		echo "{code}" | base64 -d > {app_dir}/server.py
+		...
+		ExecStart=/opt/gatekeeper/venv/bin/python -m uvicorn server:app \
+		--host 0.0.0.0 --port 80
+		
+		systemctl enable --now gatekeeper
+		curl -fsS http://127.0.0.1:80/health
+	\end{lstlisting}
+	
+	\noindent A \texttt{/health} endpoint is used as a local smoke-test and for runtime monitoring.
+	
+	\subsection{Authentication and Authorization}
+	
+	All database requests are sent to \texttt{POST /query}. The Gatekeeper requires an API key through the \texttt{X-API-Key} header. Requests missing the key or presenting an invalid key are rejected with HTTP 401 and are never forwarded to the proxy:
+	
+	\begin{lstlisting}[language=python]
+		def auth_or_401(x_api_key: Optional[str]) -> None:
+		if not x_api_key or x_api_key != API_KEY:
+		raise HTTPException(status_code=401, detail="unauthorized")
+	\end{lstlisting}
+	
+	\subsection{Query Safety Checks (Input Validity)}
+	
+	The assignment explicitly requires the Gatekeeper to reject unsafe queries (e.g., destructive DDL). This is implemented by enforcing:
+	\begin{itemize}
+		\item \textbf{single-statement only} (reject multi-statement payloads),
+		\item \textbf{denylist} for dangerous keywords (e.g., \texttt{DROP}, \texttt{TRUNCATE}, \texttt{ALTER}, privileged operations),
+		\item \textbf{allowlist} for top-level statements limited to \texttt{SELECT}, \texttt{INSERT}, \texttt{UPDATE}, \texttt{DELETE}.
+	\end{itemize}
+	
+	\begin{lstlisting}[language=python]
+		DENY_REGEX = re.compile(r"\b(DROP|TRUNCATE|ALTER|GRANT|REVOKE|...)\b", re.I)
+		ALLOW_TOPLEVEL = re.compile(r"^\s*(SELECT|INSERT|UPDATE|DELETE)\b", re.I)
+		
+		def validate_query(sql: str) -> None:
+		if not is_single_statement(sql):
+		raise HTTPException(status_code=403, detail="multiple statements")
+		if DENY_REGEX.search(sql):
+		raise HTTPException(status_code=403, detail="forbidden keyword")
+		if STRICT_ALLOWLIST and not ALLOW_TOPLEVEL.match(sql):
+		raise HTTPException(status_code=403, detail="statement not allowed")
+	\end{lstlisting}
+	
+	\noindent Additionally, response size is bounded to avoid accidental large result sets:
+	\begin{itemize}
+		\item maximum returned rows (\texttt{MAX\_ROWS}),
+		\item approximate byte cap (\texttt{MAX\_RESULT\_BYTES}).
+	\end{itemize}
+	
+	\subsection{Forwarding to the Trusted Host}
+	
+	Once authenticated and validated, the request is forwarded to the Trusted Host (ProxySQL) using a MySQL connection pool. The pool connects to the Proxy over the private network:
+	
+	\begin{lstlisting}[language=python]
+		conn_kwargs = dict(
+		host=PROXY_HOST,
+		port=PROXY_PORT,
+		user=DB_USER,
+		password=DB_PASSWORD,
+		autocommit=True,
+		connection_timeout=5,
+		)
+		_pool = mysql.connector.pooling.MySQLConnectionPool(
+		pool_name=POOL_NAME, pool_size=POOL_SIZE, **conn_kwargs
+		)
+	\end{lstlisting}
+	
+\section{Request Flow Overview}
+
+The lifecycle of a request in the final system follows a clear separation of concerns between components:
+
+\begin{enumerate}
+	\item A client sends an HTTP request containing a SQL query to the Gatekeeper, the only Internet-facing component.
+	\item The Gatekeeper authenticates the request using an API key and validates the query to ensure it is safe to execute.
+	\item Valid requests are forwarded over the private network to the Trusted Host (ProxySQL).
+	\item The Proxy classifies the query as a READ or WRITE and routes it to the appropriate database node according to the active strategy.
+	\item The database executes the query and the result is returned to the client through the Gatekeeper.
+\end{enumerate}
+
+\noindent This flow ensures that all database access is mediated by the Gatekeeper, while routing and load balancing are handled exclusively by the Proxy.
+
+	\section{Benchmarking the Cluster}
+	
+	This section describes the benchmarking methodology used to evaluate the \emph{end-to-end} system. The assignment requires sending \textbf{1000 READ} and \textbf{1000 WRITE} requests \emph{for each} proxy forwarding strategy and showing that the cluster receives and processes them appropriately. This requirement is satisfied by a deterministic workload executed through the Gatekeeper HTTP API.
+	
+	\subsection{Benchmark Client Overview}
+	
+	A dedicated Python client (\texttt{bench.py}) is used as a workload generator and measurement probe. It sends SQL queries to the Gatekeeper endpoint (\texttt{POST /query}) and measures:
+	\begin{itemize}
+		\item request success/failure (HTTP 200 vs non-200),
+		\item end-to-end latency per request (ms),
+		\item throughput over time (TPS) for READ and WRITE requests.
+	\end{itemize}
+	
+	\noindent The benchmark targets the system \emph{as deployed}: all queries traverse the Gatekeeper validation logic and are forwarded to ProxySQL as in a real execution path. This avoids measuring internal components in isolation.
+	
+	\subsection{Workload Model (Parallel READ/WRITE Streams)}
+	
+	The benchmark implements a mixed workload using exactly two concurrent streams:
+	\begin{itemize}
+		\item one sequential READ stream,
+		\item one sequential WRITE stream,
+	\end{itemize}
+	running in parallel using two threads. Each stream issues a fixed number of requests, resulting in exactly:
+	\[
+	N_{\text{reads}} = 1000,\quad N_{\text{writes}} = 1000,\quad N_{\text{total}} = 2000.
+	\]
+	
+	\noindent This approach provides a \textbf{more realistic workload} than strictly serialized execution because reads and writes contend simultaneously for shared resources (proxy routing, manager write path, locks, networking). At the same time, it avoids an overly aggressive multi-threaded generator that could shift the bottleneck to the client.
+	
+	\paragraph{Fixed queries.}
+	To ensure reproducibility, both streams use fixed SQL statements:
+	
+	\begin{lstlisting}[language=python]
+		FIXED_READ_SQL = (
+		"SELECT actor_id, first_name, last_name "
+		"FROM sakila.actor "
+		"WHERE actor_id = 1"
+		)
+		
+		FIXED_WRITE_SQL = (
+		"INSERT INTO sakila.bench_events (created_at, payload) "
+		"VALUES (NOW(6), 'x')"
+		)
+	\end{lstlisting}
+	
+	\subsection{Execution Path and Request Measurement}
+	
+	Each request is sent as a JSON payload through the Gatekeeper endpoint using an API key:
+	
+	\begin{lstlisting}[language=python]
+		code, body = http_post_json(
+		endpoint,
+		api_key,
+		{"query": sql},
+		timeout_s=timeout_s
+		)
+	\end{lstlisting}
+	
+	\noindent The client measures end-to-end latency as the wall-clock duration of the HTTP call:
+	
+	\begin{lstlisting}[language=python]
+		t0 = time.perf_counter()
+		code, body = http_post_json(...)
+		t1 = time.perf_counter()
+		lat_ms = (t1 - t0) * 1000.0
+		ok = 1 if code == 200 else 0
+	\end{lstlisting}
+	
+	\noindent Each completion is timestamped (\texttt{time.time()}) to build a time series, and a record is stored containing:
+	\begin{itemize}
+		\item kind (\texttt{read}/\texttt{write}),
+		\item success flag and HTTP status,
+		\item latency in milliseconds,
+		\item completion time (used for 1-second bucketing).
+	\end{itemize}
+	
+	\paragraph{Parallel execution.}
+	The two streams run concurrently and join at the end of the benchmark:
+	
+	\begin{lstlisting}[language=python]
+		th_r = threading.Thread(target=run_stream, args=("read", ...))
+		th_w = threading.Thread(target=run_stream, args=("write", ...))
+		
+		th_r.start(); th_w.start()
+		th_r.join();  th_w.join()
+	\end{lstlisting}
+	
+	\subsection{Derived Metrics and Output Artifacts}
+	
+	After the run completes, raw request records are aggregated into three output CSV files. Together, these outputs provide all evidence required by the assignment.
+	
+	\subsubsection{\texttt{summary.csv} (Assignment compliance: 1000 READ + 1000 WRITE)}
+	
+	A single-row summary is generated per run. It explicitly reports the number of requests sent and successfully processed:
+	
+	\begin{lstlisting}[language=python]
+		return {
+			"total_sent": total,
+			"read_sent": reads,
+			"write_sent": writes,
+			"ok_total": ok_total,
+			"ok_read": ok_reads,
+			"ok_write": ok_writes,
+			"duration_s": ...,
+			"avg_tps_ok": ...,
+		}
+	\end{lstlisting}
+	
+	\noindent This file is the direct evidence that each strategy run issues exactly 1000 read requests and 1000 write requests and that the cluster processes them (HTTP 200).
+	
+	\subsubsection{\texttt{tps\_timeseries.csv} (Throughput vs time)}
+	
+	Throughput is computed by binning request \emph{completions} into 1-second buckets. For each second $t$, the script counts total, read, and write completions, producing:
+	\[
+	\mathrm{TPS}(t) = \#\text{completions in second }t.
+	\]
+	
+	\begin{lstlisting}[language=python]
+		b = int(r.t_wall_end)  # 1s bucket
+		buckets[b]["total"] += 1
+		buckets[b][r.kind] += 1
+	\end{lstlisting}
+	
+	\noindent The resulting time series contains:
+	\texttt{total\_tps}, \texttt{read\_tps}, \texttt{write\_tps} and their raw counts, enabling plots of throughput stability and READ/WRITE balance.
+	
+	\subsubsection{\texttt{latency\_timeseries.csv} (Latency vs time, tail percentiles)}
+	
+	Latency is aggregated in the same 1-second buckets, \emph{restricted to successful requests} (HTTP 200), and summarized using:
+	\begin{itemize}
+		\item mean,
+		\item p50 (median),
+		\item p95,
+		\item p99,
+		\item max,
+	\end{itemize}
+	computed separately for READ and WRITE operations.
+	
+	\begin{lstlisting}[language=python]
+		if r.ok != 1:
+		continue
+		buckets[b][r.kind].append(r.lat_ms)
+	\end{lstlisting}
+	
+	\noindent Percentiles are computed deterministically from the bucket samples. The p95 metric is used to represent tail latency (worst-case behavior excluding extreme outliers), which is a standard indicator of user-perceived performance under load.
+	
+
+	\subsection{Running the Benchmark per Strategy}
+	
+	The benchmark is executed once per forwarding strategy. The proxy strategy is activated externally (ProxySQL configuration), while the benchmark client simply labels the output directory:
+	
+	\begin{lstlisting}[language=bash]
+		python3 bench.py --gateway-url http://<GATEWAY_PUBLIC_IP> \
+		--api-key <KEY> --strategy direct --reads 1000 --writes 1000 \
+		--outdir ./benchmarking/direct
+		
+		python3 bench.py --gateway-url http://<GATEWAY_PUBLIC_IP> \
+		--api-key <KEY> --strategy random --reads 1000 --writes 1000 \
+		--outdir ./benchmarking/random
+		
+		python3 bench.py --gateway-url http://<GATEWAY_PUBLIC_IP> \
+		--api-key <KEY> --strategy customized --reads 1000 --writes 1000 \
+		--outdir ./benchmarking/customized
+	\end{lstlisting}
+	
+	\noindent For each strategy, the produced CSV artifacts (\texttt{summary.csv}, \texttt{tps\_timeseries.csv}, \texttt{latency\_timeseries.csv}) are then used to generate the plots reported in the Results section (throughput vs time, p95 latency vs time, and cross-strategy bar comparisons).
+	
+	\section{Results}
+	
+	This section presents the experimental results obtained from benchmarking the cluster under the three proxy forwarding strategies: \emph{Direct Hit}, \emph{Random}, and \emph{Customized}.  
+	All experiments were executed with the same workload: 1000 READ and 1000 WRITE requests issued in parallel through the Gatekeeper.
+	
+	\subsection{Direct Hit Strategy}
+		\begin{figure}[H]
+			\centering
+			\includegraphics[width=0.7\linewidth]{figures/latency_vs_time_p95_direct}
+			\label{fig:latencyvstimep95direct}
+		\end{figure}
+		
+		\begin{figure}[H]
+			\centering
+			\includegraphics[width=0.7\linewidth]{figures/tps_vs_time_direct}
+			\label{fig:tpsvstimedirect}
+		\end{figure}
+
+	
+	
+	\begin{center}
+		\begin{tabular}{l r}
+			\hline
+			Metric & Value \\
+			\hline
+			Total requests sent & 2000 \\
+			READ requests & 1000 \\
+			WRITE requests & 1000 \\
+			Successful requests & 2000 \\
+			Total duration (s) & 57.99 \\
+			Average TPS (OK) & 34.49 \\
+			\hline
+		\end{tabular}
+	\end{center}
+	
+	\noindent In the Direct Hit strategy, all requests (READ and WRITE) are routed to the manager node. This provides a baseline reference for throughput and latency when no load distribution is applied.
+	
+	\subsection{Random Strategy}
+	
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.7\linewidth]{figures/latency_vs_time_p95_random}
+		\label{fig:latencyvstimep95random}
+	\end{figure}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.7\linewidth]{figures/tps_vs_time_random}
+		
+		\label{fig:tpsvstimerandom}
+	\end{figure}
+	
+	
+	\begin{center}
+		\begin{tabular}{l r}
+			\hline
+			Metric & Value \\
+			\hline
+			Total requests sent & 2000 \\
+			READ requests & 1000 \\
+			WRITE requests & 1000 \\
+			Successful requests & 2000 \\
+			Total duration (s) & 60.48 \\
+			Average TPS (OK) & 33.07 \\
+			\hline
+		\end{tabular}
+	\end{center}
+	
+	\noindent Under the Random strategy, READ requests are distributed uniformly across worker nodes while WRITE requests continue to be routed to the manager. This introduces load balancing for reads without considering node performance.
+	
+	\subsection{Customized Strategy}
+	
+	\begin{figure}[H]
+		\centering
+		\includegraphics[width=0.7\linewidth]{figures/latency_vs_time_p95_customized}
+		\label{fig:latencyvstimep95customized}
+	\end{figure}
+	
+		\begin{figure}[H]
+			\centering
+			\includegraphics[width=0.7\linewidth]{figures/tps_vs_time_customized}
+			\label{fig:tpsvstimecustomized}
+		\end{figure}
+	
+	\begin{center}
+		\begin{tabular}{l r}
+			\hline
+			Metric & Value \\
+			\hline
+			Total requests sent & 2000 \\
+			READ requests & 1000 \\
+			WRITE requests & 1000 \\
+			Successful requests & 2000 \\
+			Total duration (s) & 66.26 \\
+			Average TPS (OK) & 30.19 \\
+			\hline
+		\end{tabular}
+	\end{center}
+	
+	\noindent In the Customized strategy, READ requests are routed dynamically based on worker responsiveness. Worker weights are updated periodically according to measured ping latency, resulting in adaptive load distribution.
+	
+	\subsection{Cross-Strategy Analysis}
+	
+	Comparing the three strategies reveals clear trade-offs:
+	
+	\begin{itemize}
+		\item \textbf{Throughput:}  
+		Direct Hit achieves the highest average throughput, as it avoids proxy-level decision overhead and replication-induced read routing. Random incurs a small throughput penalty, while Customized shows the lowest average TPS due to dynamic weight adjustments and additional control logic.
+		
+		\item \textbf{Latency behavior:}  
+		Tail latency (p95) for READ operations is generally lower and more stable under Random and Customized strategies compared to Direct Hit, as read load is offloaded from the manager. Customized shows smoother latency trends, at the cost of reduced throughput.
+		
+		\item \textbf{Stability vs performance:}  
+		The Random strategy improves scalability over Direct Hit with minimal complexity. The Customized strategy prioritizes stability and responsiveness, adapting to worker performance variations while accepting reduced peak throughput.
+	\end{itemize}
+	
+	\subsection{Final Conclusions}
+	
+	The experimental results shows that:
+	\begin{itemize}
+		\item Direct Hit serves as a high-throughput baseline but does not scale read load.
+		\item Random read distribution provides a good balance between simplicity and scalability.
+		\item Customized routing offers adaptive behavior and improved latency stability under heterogeneous conditions, at the cost of lower overall throughput.
+	\end{itemize}
+	
+	\noindent Together, these results validate the functional correctness of the proxy strategies and illustrate the performance trade-offs inherent in each design choice.
+	
+	\section{Instructions to Run the Code}
+	
+	This section describes the steps required to deploy the infrastructure, configure the proxy strategy, and execute the benchmark.  
+	The deployment process is automated but \textbf{order-sensitive}; components must be created in the correct sequence to ensure correct connectivity and security isolation.
+	
+	\subsection{Prerequisites}
+	
+	Before execution, the following requirements must be satisfied:
+	
+	\begin{itemize}
+		\item An AWS account with permissions to create EC2 instances, Security Groups, and networking resources.
+		\item AWS credentials configured locally (e.g., via \texttt{aws configure}).
+		\item Python 3 environment with required dependencies installed.
+		\item The repository cloned locally, with the working directory set to the project root.
+	\end{itemize}
+	
+	\subsection{Infrastructure Deployment Script}
+	
+	The deployment is controlled by a single Python entry point that orchestrates:
+	\begin{itemize}
+		\item Security Group creation,
+		\item Database instance creation,
+		\item Proxy instance creation,
+		\item Gatekeeper instance creation.
+	\end{itemize}
+	
+	The script supports partial or full deployment via command-line flags. If no flags are provided, the full infrastructure is created in the correct order automatically.
+	
+	\subsection{Deployment Order and Rationale}
+	
+	The correct creation order is the following:
+	
+	\begin{enumerate}
+		\item \textbf{Security Groups}  
+		Must be created first, as all instances depend on their inbound and outbound rules.
+		\item \textbf{Main database instances (manager and workers)}  
+		These instances form the MySQL cluster and must exist before the proxy is configured.
+		\item \textbf{Proxy instance (ProxySQL)}  
+		Requires the private IPs of the database nodes and the selected forwarding strategy.
+		\item \textbf{Gatekeeper instance}  
+		Depends on the proxy private IP and acts as the only Internet-facing component.
+	\end{enumerate}
+	
+	\noindent The script enforces this order internally when executed without flags.
+	
+	\subsection{Full Deployment (Recommended)}
+	
+	To deploy the entire system in one step using the default strategy (\texttt{directhit}):
+	
+	\begin{lstlisting}[language=bash]
+		python3 main.py
+	\end{lstlisting}
+	
+	\noindent This command performs the following actions:
+	\begin{itemize}
+		\item creates all required Security Groups,
+		\item launches the MySQL manager and worker instances,
+		\item deploys the ProxySQL instance,
+		\item deploys the Gatekeeper instance.
+	\end{itemize}
+	
+	\subsection{Selecting the Proxy Strategy}
+	
+	The proxy forwarding strategy can be selected at deployment time using the \texttt{--strategy} flag. Supported values are:
+	\begin{itemize}
+		\item \texttt{directhit}
+		\item \texttt{random}
+		\item \texttt{customized}
+	\end{itemize}
+	
+	Example:
+	
+	\begin{lstlisting}[language=bash]
+		python3 main.py --strategy random
+	\end{lstlisting}
+	
+	\noindent This flag affects only the ProxySQL configuration. The benchmark client uses the strategy name solely as a label for result organization.
+	
+	\subsection{Partial Deployment (Advanced Usage)}
+	
+	Individual components can be created selectively if needed:
+	
+	\begin{lstlisting}[language=bash]
+		python3 main.py --sg
+		python3 main.py --instances
+		python3 main.py --proxy --strategy customized
+		python3 main.py --gateway
+	\end{lstlisting}
+	
+	\noindent This mode is intended for debugging or iterative development. The user is responsible for respecting the correct order.
+	
+	\subsection{Destroying the Infrastructure}
+	
+	To tear down all deployed resources:
+	
+	\begin{lstlisting}[language=bash]
+		python3 main.py --destroy
+	\end{lstlisting}
+	
+	\noindent This command deletes all EC2 instances and associated Security Groups created.
+	
+	\subsection{Benchmark Execution}
+	
+	Once the infrastructure has been successfully deployed (Gateway, Proxy, and MySQL cluster running), the benchmarking phase can be executed from any external machine with network access to the Gatekeeper public endpoint.
+	
+	
+	\subsubsection{Execution Command}
+	
+	The benchmark is executed by running:
+	
+	\begin{lstlisting}[language=bash]
+		python3 bench.py \
+		--gateway-url http://<GATEWAY_PUBLIC_IP> \
+		--api-key <API_KEY> \
+		--strategy <direct|random|customized> \
+		--reads 1000 \
+		--writes 1000 \
+		--outdir ./benchmarking/<strategy>
+	\end{lstlisting}
+	
+	\noindent The most relevant parameters are:
+	\begin{itemize}
+		\item \texttt{--gateway-url}: public HTTP endpoint of the Gatekeeper instance.
+		\item \texttt{--api-key}: API key required by the Gatekeeper for authentication.
+		\item \texttt{--strategy}: label identifying the proxy routing strategy used in the deployment.
+		\item \texttt{--reads}, \texttt{--writes}: number of READ and WRITE requests issued by the client.
+		\item \texttt{--outdir}: output directory where all benchmark artifacts are stored.
+	\end{itemize}
+	
+	\subsubsection{Generated Outputs}
+	
+	For each execution, the benchmark client produces the following artifacts:
+	
+	\begin{itemize}
+		\item \texttt{summary.csv}: aggregated metrics (sent vs successful requests, average TPS).
+		\item \texttt{tps\_timeseries.csv}: throughput per second, split into READ, WRITE, and TOTAL.
+		\item \texttt{latency\_timeseries.csv}: latency per second with mean, p50, p95, p99, and max values.
+		\item \texttt{raw\_requests.csv} (optional): per-request audit log for debugging and validation.
+	\end{itemize}
+	
+	These CSV files are subsequently used to generate the plots and tables presented in the Results section.
+
+	
+\end{document}
