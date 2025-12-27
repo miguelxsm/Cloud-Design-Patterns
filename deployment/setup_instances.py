@@ -10,7 +10,7 @@ def _ensure_mysqld_option_block(option_lines: str) -> str:
     # We keep it simple: if a key exists, replace; else append under [mysqld].
     # option_lines must be "key = value" lines (one per line).
     lines = [ln.strip() for ln in option_lines.strip().splitlines() if ln.strip()]
-    bash = []
+    bash: list[str] = []
     bash.append('CNF="/etc/mysql/mysql.conf.d/mysqld.cnf"')
     bash.append('if [ -f "$CNF" ]; then')
     for ln in lines:
@@ -545,6 +545,7 @@ DENY_REGEX = re.compile(
     r"""
     \b(
         DROP
+        |^DELETE\s+FROM\s+\w+\s*(?:;|\z)
         |TRUNCATE
         |ALTER
         |GRANT
@@ -621,15 +622,6 @@ class WriteResponse(BaseModel):
 app = FastAPI(title="DB Gatekeeper", version="1.0")
 _pool: Optional[pooling.MySQLConnectionPool] = None
 
-
-def require_env() -> None:
-    missing = []
-    if not API_KEY: missing.append("API_KEY")
-    if not PROXY_HOST: missing.append("PROXY_HOST")
-    if not DB_USER: missing.append("DB_USER")
-    if not DB_PASSWORD: missing.append("DB_PASSWORD")
-    if missing:
-        raise RuntimeError("Missing required values: " + ", ".join(missing))
 
 
 def create_pool() -> pooling.MySQLConnectionPool:
@@ -747,8 +739,6 @@ def query_endpoint(
         raise HTTPException(status_code=500, detail="internal error")
 '''
 
-    # Sustitución segura SOLO de los 5 parámetros (sin tocar llaves del código)
-    # Usamos repr() para que queden strings Python válidos con comillas.
     return template.format(
         API_KEY=api_key,
         PROXY_HOST=proxy_host,
